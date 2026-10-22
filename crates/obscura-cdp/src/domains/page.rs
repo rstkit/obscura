@@ -19,6 +19,63 @@ fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
     format!("{page_frame_id}-frame-{frame_id}")
 }
 
+fn is_localhost(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn secure_context_type(url: &url::Url) -> &'static str {
+    match url.scheme() {
+        "https" | "wss" | "file" | "about" => "Secure",
+        "http" | "ws" if is_localhost(url) => "SecureLocalhost",
+        _ => "InsecureScheme",
+    }
+}
+
+/// Build the required `Page.Frame` fields in one place. Generated CDP clients
+/// deserialize this object before their frame managers see it, so every path
+/// that returns or emits a frame must use the same protocol-complete shape.
+pub(crate) fn frame_value(
+    id: &str,
+    parent_id: Option<&str>,
+    loader_id: &str,
+    url: &str,
+    mime_type: &str,
+) -> Value {
+    let parsed_url = url::Url::parse(url).ok();
+    let security_origin = parsed_url
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "null".to_string());
+    let secure_context = parsed_url
+        .as_ref()
+        .map(secure_context_type)
+        .unwrap_or("InsecureScheme");
+    let mut frame = json!({
+        "id": id,
+        "loaderId": loader_id,
+        "url": url,
+        "domainAndRegistry": "",
+        "securityOrigin": security_origin,
+        "mimeType": mime_type,
+        "adFrameStatus": { "adFrameType": "none" },
+        "secureContextType": secure_context,
+        "crossOriginIsolatedContextType": "NotIsolated",
+        "gatedAPIFeatures": [],
+    });
+    if let Some(parent_id) = parent_id {
+        frame["parentId"] = json!(parent_id);
+    }
+    frame
+}
+
 fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm) -> Value {
     let id = child_frame_id(page_frame_id, frame.frame_id());
     let parent_id = if frame.parent_frame_id() == 0 {
@@ -26,16 +83,13 @@ fn child_frame_value(page_frame_id: &str, frame: &obscura_js::frame::FrameRealm)
     } else {
         child_frame_id(page_frame_id, frame.parent_frame_id())
     };
-    json!({
-        "id": id,
-        "parentId": parent_id,
-        "loaderId": format!("{id}-loader"),
-        "url": frame.url(),
-        "domainAndRegistry": "",
-        "securityOrigin": frame.origin(),
-        "mimeType": "text/html",
-        "adFrameStatus": { "adFrameType": "none" },
-    })
+    frame_value(
+        &id,
+        Some(&parent_id),
+        &format!("{id}-loader"),
+        frame.url(),
+        "text/html",
+    )
 }
 
 /// The page's child frames, flattened with each parent ahead of its children
@@ -59,7 +113,7 @@ pub fn child_frame_values(page: &obscura_browser::Page) -> Vec<Value> {
 
 /// The page's live frame hierarchy. `childFrames` used to be hardcoded empty,
 /// so a client was told the page had no frames however many it had built.
-fn frame_tree(page: &obscura_browser::Page) -> Value {
+fn frame_tree(page: &obscura_browser::Page, loader_id: &str) -> Value {
     fn children(page: &obscura_browser::Page, parent_frame_id: u32) -> Vec<Value> {
         page.frames
             .iter()
@@ -74,15 +128,13 @@ fn frame_tree(page: &obscura_browser::Page) -> Value {
     }
 
     json!({
-        "frame": {
-            "id": page.frame_id,
-            "loaderId": "initial-loader",
-            "url": page.url_string(),
-            "domainAndRegistry": "",
-            "securityOrigin": page.url_string(),
-            "mimeType": "text/html",
-            "adFrameStatus": { "adFrameType": "none" },
-        },
+        "frame": frame_value(
+            &page.frame_id,
+            None,
+            loader_id,
+            &page.url_string(),
+            "text/html",
+        ),
         "childFrames": children(page, 0),
     })
 }
@@ -281,6 +333,22 @@ fn chromium_clip_region(
 }
 
 #[cfg(feature = "render")]
+fn encode_jpeg(image: &image::RgbaImage, quality: u8) -> Result<Vec<u8>, String> {
+    let width = u16::try_from(image.width())
+        .map_err(|_| "JPEG screenshot width exceeds 65535 pixels".to_string())?;
+    let height = u16::try_from(image.height())
+        .map_err(|_| "JPEG screenshot height exceeds 65535 pixels".to_string())?;
+    let mut output = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut output, quality.max(1));
+    // Chromium's default JPEG path uses 4:2:0 chroma sampling.
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+    encoder
+        .encode(image.as_raw(), width, height, jpeg_encoder::ColorType::Rgba)
+        .map_err(|error| format!("JPEG screenshot encoding failed: {error}"))?;
+    Ok(output)
+}
+
+#[cfg(feature = "render")]
 fn encode_screenshot(
     image: &image::RgbaImage,
     options: ScreenshotOptions,
@@ -309,22 +377,7 @@ fn encode_screenshot(
                 .map_err(|error| format!("PNG screenshot encoding failed: {error}"))?;
         }
         ScreenshotFormat::Jpeg => {
-            let rgb = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
-            // image's pure-Rust JPEG encoder defines its quality range as
-            // 1..=100; Chromium permits zero, whose effective result is the
-            // lowest-quality encoding.
-            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                &mut output,
-                options.quality.max(1),
-            );
-            encoder
-                .write_image(
-                    rgb.as_raw(),
-                    rgb.width(),
-                    rgb.height(),
-                    image::ExtendedColorType::Rgb8,
-                )
-                .map_err(|error| format!("JPEG screenshot encoding failed: {error}"))?;
+            output = encode_jpeg(image, options.quality)?;
         }
         ScreenshotFormat::Webp => {
             if options.quality_supplied {
@@ -567,46 +620,75 @@ fn parse_screencast_state(params: &Value, session_id: i64) -> Result<ScreencastS
 }
 
 #[cfg(feature = "render")]
-fn encode_screencast_frame(
-    renderer_png: Vec<u8>,
+fn screencast_capture_region(
+    viewport: (f32, f32),
+    scroll: (f32, f32),
     state: &ScreencastState,
-) -> Result<Vec<u8>, String> {
-    if state.format == ScreencastFormat::Png
-        && state.max_width.is_none()
-        && state.max_height.is_none()
-    {
-        return Ok(renderer_png);
-    }
-    let source = image::load_from_memory_with_format(&renderer_png, image::ImageFormat::Png)
-        .map_err(|error| format!("Page.startScreencast could not decode renderer PNG: {error}"))?
-        .to_rgba8();
+) -> (obscura_browser::CaptureRegion, (u32, u32)) {
     let mut scale = 1.0_f64;
     if let Some(max_width) = state.max_width {
-        scale = scale.min(f64::from(max_width) / f64::from(source.width()));
+        scale = scale.min(f64::from(max_width) / f64::from(viewport.0));
     }
     if let Some(max_height) = state.max_height {
-        scale = scale.min(f64::from(max_height) / f64::from(source.height()));
+        scale = scale.min(f64::from(max_height) / f64::from(viewport.1));
     }
-    let size = (
-        (f64::from(source.width()) * scale).round().max(1.0) as u32,
-        (f64::from(source.height()) * scale).round().max(1.0) as u32,
+    let output = (
+        (f64::from(viewport.0) * scale).round().max(1.0) as u32,
+        (f64::from(viewport.1) * scale).round().max(1.0) as u32,
     );
-    let raster = if size == source.dimensions() {
-        source
-    } else {
-        image::imageops::resize(
-            &source,
-            size.0,
-            size.1,
-            image::imageops::FilterType::Triangle,
-        )
-    };
+    let native = obscura_browser::CaptureRegion::new(
+        scroll.0,
+        scroll.1,
+        viewport.0,
+        viewport.1,
+        1.0,
+    );
+    if scale >= 1.0 || obscura_browser::validate_capture_region(native).is_ok() {
+        return (native, output);
+    }
+    let scaled = obscura_browser::CaptureRegion::with_output_size(
+        scroll.0,
+        scroll.1,
+        viewport.0,
+        viewport.1,
+        scale as f32,
+        output.0,
+        output.1,
+    );
+    (scaled, output)
+}
+
+#[cfg(feature = "render")]
+fn resize_screencast_frame(
+    raster: &image::RgbaImage,
+    output: (u32, u32),
+) -> Result<image::RgbaImage, String> {
+    use fast_image_resize::{images::{Image, ImageRef}, FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let source = ImageRef::new(raster.width(), raster.height(), raster.as_raw(), PixelType::U8x4)
+        .map_err(|error| error.to_string())?;
+    let mut destination = Image::new(output.0, output.1, PixelType::U8x4);
+    // Adaptive bilinear convolution matches image's Triangle downsampling.
+    // Keep its existing RGBA-channel policy, including transparent PNG frames.
+    let options = ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
+        .use_alpha(false);
+    Resizer::new().resize(&source, &mut destination, Some(&options))
+        .map_err(|error| error.to_string())?;
+    image::RgbaImage::from_raw(output.0, output.1, destination.into_vec())
+        .ok_or_else(|| "Invalid screencast raster dimensions".to_string())
+}
+
+#[cfg(feature = "render")]
+fn encode_screencast_frame(
+    raster: &image::RgbaImage,
+    state: &ScreencastState,
+) -> Result<Vec<u8>, String> {
     let format = match state.format {
         ScreencastFormat::Png => ScreenshotFormat::Png,
         ScreencastFormat::Jpeg => ScreenshotFormat::Jpeg,
     };
     encode_screenshot(
-        &raster,
+        raster,
         ScreenshotOptions {
             format,
             quality: state.quality,
@@ -619,8 +701,9 @@ fn encode_screencast_frame(
     )
 }
 
-/// Queue a visible-viewport frame through normal CDP event transport. This is
-/// intentionally command-driven until Obscura has a compositor frame pump.
+/// Queue a visible-viewport frame through normal CDP event transport. Initial
+/// frames are immediate; later damage is coalesced by the connection's 30 Hz
+/// compositor pump.
 #[cfg(feature = "render")]
 pub(crate) fn queue_screencast_frame(
     ctx: &mut CdpContext,
@@ -646,44 +729,33 @@ pub(crate) fn queue_screencast_frame(
         state.clone()
     };
     let attached_session = Some(cdp_session_id.to_string());
-    let (viewport, scroll, png, activity_generation) = {
+    let (viewport, scroll, raster, activity_generation) = {
         let page = ctx
             .get_session_page_mut(&attached_session)
             .ok_or("No page for session")?;
         let animation_sample = page.live_animation_sample();
         let viewport = page.viewport;
-        let scroll = page
-            .evaluate("[window.scrollX, window.scrollY]")
-            .as_array()
-            .map(|values| {
-                (
-                    values.first().and_then(Value::as_f64).unwrap_or(0.0),
-                    values.get(1).and_then(Value::as_f64).unwrap_or(0.0),
-                )
-            })
-            .unwrap_or((0.0, 0.0));
-        obscura_browser::validate_capture_region(obscura_browser::CaptureRegion::new(
-            scroll.0 as f32,
-            scroll.1 as f32,
-            viewport.0,
-            viewport.1,
-            1.0,
-        ))
-        .map_err(capture_error_message)?;
-        let png = page
-            .screenshot_with_animation_sample(viewport, animation_sample)
-            .ok_or_else(|| {
-                "Page.startScreencast failed: the page has no visible DOM surface to render"
-                    .to_string()
-            })?;
+        let scroll = page.screenshot_scroll_offset();
+        let (region, output) = screencast_capture_region(viewport, scroll, &state);
+        let raster = page
+            .screenshot_region_raster_with_animation_sample(
+                region,
+                animation_sample,
+            )
+            .map_err(capture_error_message)?;
+        let raster = if raster.dimensions() == output {
+            raster
+        } else {
+            resize_screencast_frame(&raster, output)?
+        };
         let activity_generation = page
             .js
             .as_ref()
             .map(|js| js.activity_generation())
             .unwrap_or(0);
-        (viewport, scroll, png, activity_generation)
+        (viewport, scroll, raster, activity_generation)
     };
-    let encoded = encode_screencast_frame(png, &state)?;
+    let encoded = encode_screencast_frame(&raster, &state)?;
     use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(encoded);
     let Some(live) = ctx.screencasts.get_mut(cdp_session_id) else {
@@ -763,12 +835,7 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
 pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     matches!(
         method,
-        "Page.navigate"
-            | "Page.reload"
-            | "Page.navigateToHistoryEntry"
-            | "Runtime.evaluate"
-            | "Runtime.callFunctionOn"
-            | "Input.dispatchMouseEvent"
+        "Input.dispatchMouseEvent"
             | "Input.dispatchKeyEvent"
             | "Input.dispatchTouchEvent"
             | "Emulation.setDeviceMetricsOverride"
@@ -779,6 +846,32 @@ pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
             | "DOM.focus"
             | "DOM.setFileInputFiles"
     )
+}
+
+#[cfg(feature = "render")]
+pub(crate) fn schedule_screencast_frame(
+    ctx: &mut CdpContext,
+    cdp_session_id: &Option<String>,
+) {
+    if let Some(state) = cdp_session_id
+        .as_deref()
+        .and_then(|session_id| ctx.screencasts.get_mut(session_id))
+    {
+        state.autonomous_frame_pending = true;
+    }
+}
+
+/// Whether a request reported after navigation may be paused for the client.
+/// Chrome only pauses requests that match the `Fetch.enable` URL patterns;
+/// omitted patterns mean every request.
+fn fetch_pause_matches(ctx: &CdpContext, url: &str) -> bool {
+    ctx.fetch_intercept.enabled
+        && (ctx.fetch_intercept.patterns.is_empty()
+            || ctx
+                .fetch_intercept
+                .patterns
+                .iter()
+                .any(|pattern| obscura_browser::url_matches_cdp_pattern(pattern, url)))
 }
 
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
@@ -796,8 +889,10 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    let event_start = ctx.pending_events.len();
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
+    ctx.nav_events_emitted.insert(page_id.to_string());
     let es = session_id.clone();
     let ts = timestamp();
 
@@ -852,59 +947,63 @@ pub fn emit_navigation_events(
             params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
             session_id: es.clone(),
         });
+        if fetch_pause_matches(ctx, &net_event.url) {
+            ctx.pending_events.push(CdpEvent {
+                method: "Fetch.requestPaused".into(),
+                params: json!({
+                    "requestId": rid,
+                    "request": {
+                        "url": net_event.url,
+                        "method": net_event.method,
+                        "headers": net_event.headers,
+                    },
+                    "frameId": frame_id,
+                    "resourceType": net_event.resource_type,
+                    "networkId": rid,
+                }),
+                session_id: es.clone(),
+            });
+        }
     }
 
-    // executionContextsCleared invalidates every prior context id, so a
-    // Runtime.evaluate / callFunctionOn targeting a pre-navigation context
-    // must be rejected (Chrome: "Cannot find context with specified id"). The
-    // default world (id 2) and isolated worlds are re-registered below as their
-    // executionContextCreated events are emitted. Issue #407: previously this
-    // set was insert-only, so stale ids kept validating and grew unbounded.
-    ctx.valid_context_ids.clear();
-    let mut phase1 = vec![
-        CdpEvent {
-            method: "Page.lifecycleEvent".into(),
-            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextsCleared".into(),
-            params: json!({}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Page.frameNavigated".into(),
-            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": nav_mime, "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
-            session_id: es.clone(),
-        },
-        CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        },
-    ];
-    // The default world is re-created as context id 2; re-register it. Isolated
-    // worlds register themselves via next_isolated_context in the loop below.
-    ctx.valid_context_ids.insert(2);
-    let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
-        vec!["__puppeteer_utility_world__24.40.0".to_string()]
-    } else {
-        ctx.isolated_worlds.clone()
-    };
-    // Issue #192: fresh, monotonically increasing executionContextId per re-create.
-    for world_name in &world_names {
-        let world_ctx_id = ctx.next_isolated_context();
-        phase1.push(CdpEvent {
-            method: "Runtime.executionContextCreated".into(),
-            params: json!({"context": {"id": world_ctx_id, "origin": page_url, "name": world_name, "uniqueId": format!("ctx-isolated-nav-{}-{}", page_id, world_ctx_id), "auxData": {"isDefault": false, "type": "isolated", "frameId": frame_id}}}),
-            session_id: es.clone(),
-        });
+    let contexts = ctx.commit_default_context(page_id, frame_id, page_url);
+    let runtime_sessions = ctx.runtime_sessions_for_page(page_id);
+    let mut phase1 = vec![CdpEvent {
+        method: "Page.lifecycleEvent".into(),
+        params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+        session_id: es.clone(),
+    }];
+    for runtime_session in &runtime_sessions {
+        phase1.push(CdpEvent::with_session(
+            "Runtime.executionContextsCleared",
+            json!({}),
+            runtime_session.clone(),
+        ));
+    }
+    phase1.push(CdpEvent {
+        method: "Page.frameNavigated".into(),
+        params: json!({"frame": frame_value(frame_id, None, loader_id, page_url, &nav_mime), "type": "Navigation"}),
+        session_id: es.clone(),
+    });
+    for runtime_session in runtime_sessions {
+        for context in &contexts {
+            phase1.push(super::runtime::execution_context_created_event(
+                context,
+                Some(runtime_session.clone()),
+            ));
+        }
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
     ctx.pending_events.extend(phase1);
 
     if ctx.fetch_intercept.enabled {
         for (i, net_event) in network_events.iter().enumerate() {
+            if Some(i) == nav_idx
+                || net_event.intercepted
+                || !fetch_pause_matches(ctx, &net_event.url)
+            {
+                continue;
+            }
             let rid = &nav_request_ids[i];
             ctx.pending_events.push(CdpEvent {
                 method: "Fetch.requestPaused".into(),
@@ -926,12 +1025,16 @@ pub fn emit_navigation_events(
 
     for (i, net_event) in network_events.iter().enumerate() {
         let rid = &nav_request_ids[i];
-        if Some(i) != nav_idx {
+        if Some(i) != nav_idx && !net_event.intercepted {
             ctx.pending_events.push(CdpEvent {
                 method: "Network.requestWillBeSent".into(),
                 params: json!({"requestId": rid, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}),
                 session_id: es.clone(),
             });
+        }
+        if let Some(error_text) = &net_event.error_text {
+            ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
+            continue;
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
@@ -945,7 +1048,19 @@ pub fn emit_navigation_events(
         });
     }
 
-    let mut phase3 = vec![
+    // A recorder can stop as soon as navigation completes. Give the new
+    // document a compositor opportunity before publishing that boundary,
+    // through the normal sampling and bounded acknowledgement window.
+    #[cfg(feature = "render")]
+    if session_id.as_ref().is_some_and(|id| ctx.screencasts.contains_key(id)) {
+        schedule_screencast_frame(ctx, session_id);
+        if let Err(error) = queue_screencast_frame(ctx, session_id, false) {
+            tracing::warn!("could not produce navigation screencast frame: {error}");
+        }
+    }
+    let mut phase3 = if ctx.get_page(page_id).is_some_and(|page| page.lifecycle == obscura_browser::LifecycleState::Failed) {
+        Vec::new()
+    } else { vec![
         CdpEvent {
             method: "Page.lifecycleEvent".into(),
             params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
@@ -966,8 +1081,8 @@ pub fn emit_navigation_events(
             params: json!({"timestamp": ts}),
             session_id: es.clone(),
         },
-    ];
-    if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
+    ] };
+    if !phase3.is_empty() && (reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded)) {
         let idle_ts = timestamp();
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
@@ -1001,6 +1116,67 @@ pub fn emit_navigation_events(
             }
         }),
     ));
+    fan_out_network_events(ctx, page_id, session_id, event_start);
+}
+
+/// Additional sessions observing the same target. Fetch pauses and lifecycle
+/// ownership stay with the existing driving session.
+pub(crate) fn network_observer_sessions(
+    ctx: &CdpContext,
+    page_id: &str,
+    source: &Option<String>,
+) -> Vec<String> {
+    let mut observers = ctx.sessions.iter()
+        .filter(|(session, page)| page.as_str() == page_id && source.as_ref() != Some(*session))
+        .map(|(session, _)| session.clone())
+        .collect::<Vec<_>>();
+    observers.sort_unstable();
+    observers
+}
+
+fn fan_out_network_events(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    source: &Option<String>,
+    event_start: usize,
+) {
+    let observers = network_observer_sessions(ctx, page_id, source);
+    if observers.is_empty() {
+        return;
+    }
+    let event_end = ctx.pending_events.len();
+    for observer in observers {
+        for index in event_start..event_end {
+            let event = &ctx.pending_events[index];
+            if matches!(event.method.as_str(),
+                "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFinished" | "Network.loadingFailed")
+            {
+                let copy = CdpEvent {
+                    method: event.method.clone(),
+                    params: event.params.clone(),
+                    session_id: Some(observer.clone()),
+                };
+                ctx.pending_events.push(copy);
+            }
+        }
+    }
+}
+
+pub(crate) fn emit_same_document_navigation(
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+    frame_id: &str,
+    url: &str,
+) {
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.navigatedWithinDocument".into(),
+        params: json!({
+            "frameId": frame_id,
+            "url": url,
+            "navigationType": "historyApi",
+        }),
+        session_id: session_id.clone(),
+    });
 }
 
 /// Emit completed script-initiated requests after the document lifecycle has
@@ -1017,6 +1193,7 @@ pub(crate) fn emit_runtime_network_events(
     if network_events.is_empty() {
         return;
     }
+    let event_start = ctx.pending_events.len();
     let loader_id = ctx
         .current_loader_ids
         .get(page_id)
@@ -1024,25 +1201,31 @@ pub(crate) fn emit_runtime_network_events(
         .unwrap_or_else(|| format!("loader-blank-{page_id}"));
     for network_event in network_events {
         let request_id = &network_event.request_id;
-        ctx.pending_events.push(CdpEvent {
-            method: "Network.requestWillBeSent".into(),
-            params: json!({
-                "requestId": request_id,
-                "loaderId": loader_id,
-                "documentURL": page_url,
-                "request": {
-                    "url": network_event.url,
-                    "method": network_event.method,
-                    "headers": network_event.headers,
-                },
-                "timestamp": network_event.timestamp,
-                "wallTime": network_event.timestamp,
-                "initiator": {"type": "script"},
-                "type": network_event.resource_type,
-                "frameId": frame_id,
-            }),
-            session_id: session_id.clone(),
-        });
+        if !network_event.intercepted {
+            ctx.pending_events.push(CdpEvent {
+                method: "Network.requestWillBeSent".into(),
+                params: json!({
+                    "requestId": request_id,
+                    "loaderId": loader_id,
+                    "documentURL": page_url,
+                    "request": {
+                        "url": network_event.url,
+                        "method": network_event.method,
+                        "headers": network_event.headers,
+                    },
+                    "timestamp": network_event.timestamp,
+                    "wallTime": network_event.timestamp,
+                    "initiator": {"type": "script"},
+                    "type": network_event.resource_type,
+                    "frameId": frame_id,
+                }),
+                session_id: session_id.clone(),
+            });
+        }
+        if let Some(error_text) = &network_event.error_text {
+            ctx.pending_events.push(network_loading_failed(network_event, request_id, session_id.clone(), error_text));
+            continue;
+        }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({
@@ -1074,6 +1257,44 @@ pub(crate) fn emit_runtime_network_events(
             session_id: session_id.clone(),
         });
     }
+    fan_out_network_events(ctx, page_id, session_id, event_start);
+}
+
+fn network_loading_failed(
+    event: &obscura_browser::NetworkEvent, request_id: &str,
+    session_id: Option<String>, error_text: &str,
+) -> CdpEvent {
+    CdpEvent {
+        method: "Network.loadingFailed".into(),
+        params: json!({"requestId": request_id, "timestamp": event.timestamp,
+            "type": event.resource_type, "errorText": error_text,
+            "canceled": error_text == "net::ERR_ABORTED"}),
+        session_id,
+    }
+}
+
+pub(crate) fn emit_aborted_navigation(
+    ctx: &mut CdpContext, session_id: &Option<String>, frame_id: &str,
+    loader_id: &str, url: &str, method: &str, page_id: &str,
+) {
+    let start = ctx.pending_events.len();
+    let ts = timestamp();
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.requestWillBeSent".into(), session_id: session_id.clone(),
+        params: json!({"requestId": loader_id, "loaderId": loader_id, "documentURL": url,
+            "request": {"url": url, "method": method, "headers": {}}, "timestamp": ts,
+            "wallTime": ts, "initiator": {"type": "other"}, "type": "Document", "frameId": frame_id}),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Network.loadingFailed".into(), session_id: session_id.clone(),
+        params: json!({"requestId": loader_id, "timestamp": ts, "type": "Document",
+            "errorText": "net::ERR_ABORTED", "canceled": true}),
+    });
+    ctx.pending_events.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(), session_id: session_id.clone(),
+        params: json!({"frameId": frame_id}),
+    });
+    fan_out_network_events(ctx, page_id, session_id, start);
 }
 
 /// Parse the `waitUntil` argument that Puppeteer/Playwright pass on
@@ -1207,7 +1428,47 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
-        "enable" => Ok(json!({})),
+        "enable" => {
+            // Chrome loads a new target's initial about:blank right after
+            // createTarget, so by the time a client attaches and calls
+            // Page.enable the page has already produced its load events.
+            // obscura creates pages silently, which starves clients that wait
+            // for the initial load: chromiumoxide's new_page blocks until the
+            // main frame's "load" lifecycle event arrives (#833). Emit those
+            // events once, the first time a session enables the page domain
+            // on a page that has not emitted a navigation. This is not a
+            // document change, so there is no execution-context churn: the
+            // existing context announced by Runtime.enable stays valid.
+            let initial = ctx.get_session_page(session_id).and_then(|page| {
+                if ctx.nav_events_emitted.contains(&page.id) {
+                    return None;
+                }
+                Some((page.id.clone(), page.frame_id.clone(), page.url_string()))
+            });
+            if let Some((page_id, frame_id, url)) = initial {
+                ctx.nav_events_emitted.insert(page_id.clone());
+                let ts = timestamp();
+                let loader_id = format!("loader-blank-{page_id}");
+                let es = session_id.clone();
+                // Build the frame through the schema-complete helper: generated
+                // CDP clients (chromiumoxide) reject a frameNavigated payload
+                // missing secureContextType/crossOriginIsolatedContextType and
+                // drop the whole connection (#833).
+                let frame = frame_value(&frame_id, None, &loader_id, &url, "text/html");
+                let events = vec![
+                    CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": frame, "type": "Navigation"}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() },
+                    CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id, "timestamp": ts}), session_id: es },
+                ];
+                ctx.pending_events.extend(events);
+            }
+            Ok(json!({}))
+        }
         "navigate" => {
             let url = params
                 .get("url")
@@ -1225,76 +1486,149 @@ pub async fn handle(
             });
             do_navigate(&current_url, &reload_params, ctx, session_id).await
         }
+        "close" => {
+            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let target_id = page.id.clone();
+            if ctx.pending_beforeunload_close.contains_key(&target_id) { return Ok(json!({})); }
+            let confirmation = if page.has_js() {
+                ctx.get_session_page_mut(session_id).ok_or("No page for session")?
+                    .evaluate("globalThis.__obscura_fireBeforeUnload()")
+                    .as_bool().ok_or("Could not run beforeunload handlers")?
+            } else { false };
+            if confirmation {
+                let url = ctx.get_page(&target_id).ok_or("No page")?.url_string();
+                ctx.pending_beforeunload_close.insert(target_id, session_id.clone());
+                ctx.pending_events.push(CdpEvent {
+                    method: "Page.javascriptDialogOpening".into(), session_id: session_id.clone(),
+                    params: json!({"url": url, "type": "beforeunload", "message": "",
+                        "hasBrowserHandler": true, "defaultPrompt": ""}),
+                });
+                return Ok(json!({}));
+            }
+            crate::domains::target::close_target(ctx, &target_id);
+            Ok(json!({}))
+        }
+        "handleJavaScriptDialog" => {
+            let target_id = ctx.get_session_page(session_id).ok_or("No page for session")?.id.clone();
+            let accept = params.get("accept").and_then(|value| value.as_bool()).ok_or("accept required")?;
+            let owner = ctx.pending_beforeunload_close.remove(&target_id).ok_or("No dialog is showing")?;
+            ctx.pending_events.push(CdpEvent {
+                method: "Page.javascriptDialogClosed".into(), session_id: owner,
+                params: json!({"result": accept, "userInput": ""}),
+            });
+            if accept { crate::domains::target::close_target(ctx, &target_id); }
+            Ok(json!({}))
+        }
+        "stopLoading" => {
+            ctx.get_session_page_mut(session_id).ok_or("No page for session")?.stop_loading();
+            Ok(json!({}))
+        }
         "getFrameTree" => {
             let page = ctx
                 .get_session_page(session_id)
                 .ok_or("No page for session")?;
-            Ok(json!({ "frameTree": frame_tree(page) }))
+            let loader_id = ctx
+                .current_loader_ids
+                .get(&page.id)
+                .cloned()
+                .unwrap_or_else(|| format!("loader-blank-{}", page.id));
+            Ok(json!({ "frameTree": frame_tree(page, &loader_id) }))
         }
         "createIsolatedWorld" => {
-            let (frame_id_param, world_name, page_url, page_id) = {
+            let (frame_id_param, world_name, origin, page_id, persist_across_navigation) = {
                 let page = ctx
                     .get_session_page(session_id)
                     .ok_or("No page for session")?;
-                (
-                    params
+                let frame_id = params
                         .get("frameId")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&page.frame_id)
-                        .to_string(),
+                        .to_string();
+                let (origin, persist) = if frame_id == page.frame_id {
+                    (page.url_string(), true)
+                } else if let Some(frame) = page.frames.iter().find(|frame| {
+                    child_frame_id(&page.frame_id, frame.frame_id()) == frame_id
+                }) {
+                    (frame.url().to_string(), false)
+                } else {
+                    return Err(format!("No frame with given id found: {frame_id}"));
+                };
+                (
+                    frame_id,
                     params
                         .get("worldName")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    page.url_string(),
+                    origin,
                     page.id.clone(),
+                    persist,
                 )
             };
-            // Track this world so Page.navigate can re-emit a context for it
-            // post-navigation. Without this, Playwright (and Puppeteer)
-            // hang in any operation that uses the utility world — including
-            // page.title() — because their utility world is gone after
-            // Runtime.executionContextsCleared and never re-created.
-            if !world_name.is_empty() && !ctx.isolated_worlds.contains(&world_name) {
-                ctx.isolated_worlds.push(world_name.clone());
+            ctx.ensure_default_context(&page_id)
+                .ok_or("No page for session")?;
+            let (context, created) = ctx.create_isolated_context(
+                &page_id,
+                &frame_id_param,
+                &origin,
+                &world_name,
+                persist_across_navigation,
+            );
+            if created {
+                for runtime_session in ctx.runtime_sessions_for_page(&page_id) {
+                    ctx.pending_events.push(super::runtime::execution_context_created_event(
+                        &context, Some(runtime_session),
+                    ));
+                }
             }
-            // Issue #192: every isolated world emission gets a fresh id from
-            // the monotonic counter and is registered as a valid contextId.
-            // Reusing id 100 across navigations made Playwright's bookkeeping
-            // diverge (it expected 101 on the second nav) and Runtime.evaluate
-            // failed with "Cannot find context with specified id: 101".
-            let context_id = ctx.next_isolated_context();
 
-            ctx.pending_events.push(CdpEvent {
-                method: "Runtime.executionContextCreated".to_string(),
-                params: json!({
-                    "context": {
-                        "id": context_id,
-                        "origin": page_url,
-                        "name": world_name,
-                        "uniqueId": format!("ctx-isolated-{}-{}", page_id, context_id),
-                        "auxData": {
-                            "isDefault": false,
-                            "type": "isolated",
-                            "frameId": frame_id_param,
-                        }
-                    }
-                }),
-                session_id: session_id.clone(),
-            });
-
-            Ok(json!({ "executionContextId": context_id }))
+            Ok(json!({ "executionContextId": context.id }))
         }
-        "setLifecycleEventsEnabled" => Ok(json!({})),
+        "setLifecycleEventsEnabled" => {
+            let enabled = params.get("enabled").and_then(Value::as_bool)
+                .ok_or("enabled must be a boolean")?;
+            if let Some(session) = session_id {
+                if !ctx.sessions.contains_key(session) {
+                    return Err("Unknown page session".to_string());
+                }
+                if enabled {
+                    ctx.lifecycle_enabled_sessions.insert(session.clone());
+                } else {
+                    ctx.lifecycle_enabled_sessions.remove(session);
+                }
+            }
+            Ok(json!({}))
+        }
         "addScriptToEvaluateOnNewDocument" => {
             let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let run_immediately = params.get("runImmediately").and_then(Value::as_bool).unwrap_or(false);
+            if run_immediately && params.get("worldName").and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty())
+            {
+                return Err("Immediate scripts in isolated worlds are not supported".to_string());
+            }
             ctx.preload_counter += 1;
             let identifier = format!("{}", ctx.preload_counter);
             if !source.is_empty() {
-                ctx.preload_scripts
-                    .push((identifier.clone(), source.to_string()));
+                if run_immediately {
+                    let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+                    // Script exceptions do not reject the registration. Dispatch
+                    // supplies the V8 lock and watchdog for this command.
+                    if let Err(error) = page.execute_preload_script(source) {
+                        tracing::warn!("Immediate preload: {error}");
+                    }
+                    if let Some(js) = &mut page.js {
+                        for frame in &page.frames {
+                            if let Err(error) = frame.execute_script(js, source) {
+                                tracing::warn!("Immediate frame preload: {error}");
+                            }
+                        }
+                    }
+                }
             }
+            // Store empty sources too: Chrome returns a removable id for them.
+            ctx.preload_scripts
+                .push((identifier.clone(), source.to_string()));
             Ok(json!({ "identifier": identifier }))
         }
         "removeScriptToEvaluateOnNewDocument" => {
@@ -1302,13 +1636,29 @@ pub async fn handle(
                 .get("identifier")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Chrome reports an unknown or already removed id as an error.
+            let before = ctx.preload_scripts.len();
             ctx.preload_scripts.retain(|(id, _)| id != identifier);
+            if ctx.preload_scripts.len() == before {
+                return Err("Script not found".to_string());
+            }
             Ok(json!({}))
         }
         "setInterceptFileChooserDialog" => Ok(json!({})),
         // Obscura does not download files to disk, so there is no behavior to
         // configure; ack it so clients that set it do not warn (issue #340).
         "setDownloadBehavior" => Ok(json!({})),
+        // Obscura never enforces Content-Security-Policy: it reports no
+        // securitypolicyviolation and blocks no resource, so a document's CSP
+        // already has no effect on fetches or script execution. There is
+        // nothing to bypass, so both values ack. Validate the parameter
+        // anyway, so a client sending the wrong type fails on the wire the way
+        // Chrome fails instead of silently ignoring it (issue #1224).
+        "setBypassCSP" => {
+            params.get("enabled").and_then(Value::as_bool)
+                .ok_or("enabled must be a boolean")?;
+            Ok(json!({}))
+        }
         "getLayoutMetrics" => {
             // Playwright calls this before every page.screenshot(). Report the
             // same live CSS viewport that responsive page code and paint use.
@@ -1399,34 +1749,52 @@ pub async fn handle(
         }
         "navigateToHistoryEntry" => {
             let entry_id = params.get("entryId").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let target_url = {
+            // Snapshot history and the current cursor BEFORE moving it, so a
+            // navigation that fails can roll back to where the page actually is
+            // instead of leaving currentIndex on an entry it never reached (#920).
+            let (target_url, saved_history, prev_index) = {
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page for session")?;
                 let url = page.history.get(entry_id).cloned();
+                let snapshot = (page.history.clone(), page.history_index);
                 if url.is_some() {
                     page.set_history_index(entry_id);
                 }
-                url
+                (url, snapshot.0, snapshot.1)
             };
             if let Some(url) = target_url {
-                // Stash + restore history so push_history doesn't clobber
-                // the cursor we just moved.
-                let stash = {
+                let preload_scripts: Vec<String> =
+                    ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
+                let nav_result = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
-                    (page.history.clone(), page.history_index)
+                    // Same as do_navigate: the page keeps its own copy, so refresh it.
+                    page.set_preload_scripts(preload_scripts);
+                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
+                        .await
                 };
+                // navigate_with_wait's push_history rewrote history during the
+                // load, so restore the snapshot either way. On failure the page
+                // never moved — put the cursor back where it was (#920).
+                if let Err(e) = nav_result {
+                    if let Some(page) = ctx.get_session_page_mut(session_id) {
+                        page.history = saved_history;
+                        page.history_index = prev_index;
+                        page.sync_js_session_history();
+                    }
+                    return Err(e.to_string());
+                }
                 let (frame_id, page_id, network_events, page_url, reached_idle) = {
                     let page = ctx
                         .get_session_page_mut(session_id)
                         .ok_or("No page for session")?;
-                    page.navigate_with_wait(&url, WaitUntil::DomContentLoaded)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    page.history = stash.0;
-                    page.history_index = stash.1;
+                    page.set_history(saved_history, entry_id);
+                    // Flush script-initiated network events before draining,
+                    // matching do_navigate — otherwise fetch/XHR requests the
+                    // navigated page starts are dropped from CDP events (#920).
+                    page.sync_js_network_events();
                     (
                         page.frame_id.clone(),
                         page.id.clone(),
@@ -1452,8 +1820,7 @@ pub async fn handle(
         }
         "resetNavigationHistory" => {
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.history.clear();
-                page.history_index = 0;
+                page.set_history(Vec::new(), 0);
             }
             Ok(json!({}))
         }
@@ -1661,7 +2028,7 @@ pub async fn handle(
     }
 }
 
-fn timestamp() -> f64 {
+pub(crate) fn timestamp() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1672,6 +2039,348 @@ fn timestamp() -> f64 {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    fn observer_fixture() -> (CdpContext, String, Option<String>, Vec<obscura_browser::NetworkEvent>) {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let unrelated_page = ctx.create_page();
+        let driver = Some("driver".to_string());
+        for (session, target) in [("driver", &page), ("observer-a", &page), ("observer-b", &page), ("unrelated", &unrelated_page)] {
+            ctx.sessions.insert(session.into(), target.clone());
+        }
+        let events = [("document-internal", "Document", "https://example.test/", 200),
+            ("script-1", "Script", "https://example.test/app.js", 404)]
+            .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
+                request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+                resource_type: kind.into(), status, headers: Default::default(),
+                response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
+                error_text: None,
+            }).collect();
+        (ctx, page, driver, events)
+    }
+
+    fn assert_observer_network(ctx: &CdpContext) {
+        let network = |session: &str| ctx.pending_events.iter()
+            .filter(|event| event.session_id.as_deref() == Some(session) && event.method.starts_with("Network."))
+            .map(|event| (&event.method, &event.params)).collect::<Vec<_>>();
+        let driver = network("driver");
+        assert!(!driver.is_empty());
+        assert_eq!(network("observer-a"), driver);
+        assert_eq!(network("observer-b"), driver);
+        assert!(network("unrelated").is_empty());
+        assert!(ctx.pending_events.iter().filter(|event| event.session_id.as_deref().is_some_and(|id| id.starts_with("observer")))
+            .all(|event| event.method.starts_with("Network.")), "observers must not receive driving-session lifecycle or Fetch pauses");
+    }
+
+    #[test]
+    fn navigation_network_events_reach_all_target_observers_with_identical_ids() {
+        let (mut ctx, page, driver, events) = observer_fixture();
+        ctx.fetch_intercept.enabled = true;
+        emit_navigation_events(&mut ctx, &driver, "frame-1", "loader-1", "https://example.test/",
+            &page, &events, WaitUntil::Load, false);
+        assert_observer_network(&ctx);
+        let observer = ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).collect::<Vec<_>>();
+        assert_eq!(observer.len(), 6);
+        assert_eq!(observer[0].params["requestId"], "loader-1");
+        assert_eq!(observer[1].params["requestId"], "loader-1");
+        assert_eq!(observer[4].params["response"]["status"], 404);
+    }
+
+    #[test]
+    fn live_network_events_reach_observers_once_without_replaying_old_events() {
+        let (mut ctx, page, driver, events) = observer_fixture();
+        ctx.pending_events.push(CdpEvent { method: "Network.loadingFinished".into(), params: json!({"requestId":"old"}), session_id: driver.clone() });
+        let old = ctx.pending_events.remove(0);
+        emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events);
+        assert_observer_network(&ctx);
+        assert_eq!(ctx.pending_events.len(), 18);
+        // Existing queued events must not be copied with the next batch.
+        ctx.pending_events.insert(0, old);
+        let start = ctx.pending_events.len();
+        emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[1..]);
+        assert_eq!(ctx.pending_events.len() - start, 9);
+        assert!(ctx.pending_events[start..].iter().all(|event| event.params["requestId"] == "script-1"));
+    }
+
+    #[test]
+    fn failed_network_events_reach_observers_once_with_original_request_identity() {
+        let (mut ctx, page, driver, mut events) = observer_fixture();
+        events[1].status = 0;
+        events[1].error_text = Some("net::ERR_ABORTED".into());
+        for navigation in [false, true] {
+            for intercepted in [false, true] {
+                ctx.pending_events.clear();
+                events[1].intercepted = intercepted;
+                if navigation {
+                    emit_navigation_events(&mut ctx, &driver, "frame-1", "loader-1", "https://example.test/",
+                        &page, &events[1..], WaitUntil::Load, false);
+                } else {
+                    emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[1..]);
+                }
+                assert_observer_network(&ctx);
+                for session in ["driver", "observer-a", "observer-b"] {
+                    let network = ctx.pending_events.iter().filter(|event|
+                        event.session_id.as_deref() == Some(session) && event.method.starts_with("Network.")
+                    ).collect::<Vec<_>>();
+                    assert_eq!(network.len(), if intercepted { 1 } else { 2 });
+                    let failure = network.last().unwrap();
+                    assert_eq!(failure.method, "Network.loadingFailed");
+                    assert_eq!(failure.params["requestId"], "script-1");
+                    assert_eq!(failure.params["errorText"], "net::ERR_ABORTED");
+                    assert_eq!(failure.params["type"], "Script");
+                    assert_eq!(failure.params["canceled"], true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detached_observers_stop_receiving_intercepted_response_events() {
+        let (mut ctx, page, driver, mut events) = observer_fixture();
+        ctx.sessions.remove("observer-b");
+        events[0].intercepted = true;
+        emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[..1]);
+        assert_eq!(ctx.pending_events.len(), 4);
+        assert!(ctx.pending_events.iter().all(|event| event.method != "Network.requestWillBeSent"));
+        assert_eq!(ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).count(), 2);
+        assert!(!ctx.pending_events.iter().any(|event| event.session_id.as_deref() == Some("observer-b")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn immediate_preload_runs_in_existing_frames_and_remains_removable() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        handle("navigate", &json!({"url":"about:blank"}), &mut ctx, &session)
+            .await.unwrap();
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            let frame = obscura_js::frame::FrameRealm::new(
+                page.js.as_mut().unwrap(), 1, 0, "https://frame.example/", "<p>child</p>",
+            ).unwrap();
+            page.frames.push(frame);
+        }
+        let deferred = handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.deferred = (globalThis.deferred || 0) + 1",
+        }), &mut ctx, &session).await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap()
+            .evaluate("globalThis.deferred ?? 0").unwrap().as_f64(), Some(0.0));
+        let immediate = handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.immediate = (globalThis.immediate || 0) + 1",
+            "runImmediately":true,
+        }), &mut ctx, &session).await.unwrap();
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.immediate ?? 0").unwrap().as_f64(), Some(1.0));
+            assert_eq!(page.evaluate_in_frame(0, "globalThis.immediate ?? 0").unwrap().as_f64(), Some(1.0));
+        }
+        handle("navigate", &json!({"url":"data:text/html,<title>next</title>"}), &mut ctx, &session)
+            .await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap()
+            .evaluate("[globalThis.deferred, globalThis.immediate]").unwrap(), json!([1,1]));
+        for registration in [deferred, immediate] {
+            handle("removeScriptToEvaluateOnNewDocument", &registration, &mut ctx, &session)
+                .await.unwrap();
+        }
+        let throwing = handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"throw new Error('script error is not a protocol error')", "runImmediately":true,
+        }), &mut ctx, &session).await.unwrap();
+        handle("removeScriptToEvaluateOnNewDocument", &throwing, &mut ctx, &session).await.unwrap();
+        handle("navigate", &json!({"url":"data:text/html,<title>removed</title>"}), &mut ctx, &session)
+            .await.unwrap();
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap()
+            .evaluate("[globalThis.deferred ?? 0, globalThis.immediate ?? 0]").unwrap(), json!([0,0]));
+        // Named worlds currently share the main global. Do not silently inject
+        // an explicitly isolated immediate script into the page's own world.
+        let isolated = handle("addScriptToEvaluateOnNewDocument", &json!({
+            "source":"globalThis.leaked = true", "runImmediately":true, "worldName":"private",
+        }), &mut ctx, &session).await;
+        assert!(isolated.is_err());
+        assert!(ctx.preload_scripts.is_empty());
+    }
+
+    async fn preload_state(ctx: &mut CdpContext, session: &Option<String>) -> serde_json::Value {
+        ctx.get_session_page_mut(session).unwrap().js.as_mut().unwrap()
+            .evaluate("[globalThis.a ?? 0, globalThis.b ?? 0]").unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_one_preload_keeps_the_other_and_unknown_id_errors() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let a = handle("addScriptToEvaluateOnNewDocument", &json!({"source":"globalThis.a = 1"}),
+            &mut ctx, &session).await.unwrap();
+        let b = handle("addScriptToEvaluateOnNewDocument", &json!({"source":"globalThis.b = 1"}),
+            &mut ctx, &session).await.unwrap();
+        // An empty source still gets an identifier, so it must be removable.
+        let empty = handle("addScriptToEvaluateOnNewDocument", &json!({"source":""}),
+            &mut ctx, &session).await.unwrap();
+        handle("navigate", &json!({"url":"data:text/html,<title>one</title>"}), &mut ctx, &session)
+            .await.unwrap();
+        assert_eq!(preload_state(&mut ctx, &session).await, json!([1, 1]));
+
+        handle("removeScriptToEvaluateOnNewDocument", &a, &mut ctx, &session).await.unwrap();
+        handle("removeScriptToEvaluateOnNewDocument", &empty, &mut ctx, &session).await.unwrap();
+        handle("navigate", &json!({"url":"data:text/html,<title>two</title>"}), &mut ctx, &session)
+            .await.unwrap();
+        assert_eq!(preload_state(&mut ctx, &session).await, json!([0, 1]));
+        assert_eq!(ctx.preload_scripts.len(), 1);
+
+        // Chrome: "Script not found" for an id that is unknown or already removed.
+        for params in [a, json!({"identifier":"nope"}), json!({})] {
+            let error = handle("removeScriptToEvaluateOnNewDocument", &params, &mut ctx, &session)
+                .await.unwrap_err();
+            assert_eq!(error, "Script not found");
+        }
+        assert_eq!(ctx.preload_scripts.len(), 1);
+        handle("removeScriptToEvaluateOnNewDocument", &b, &mut ctx, &session).await.unwrap();
+        assert!(ctx.preload_scripts.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_navigation_uses_the_current_preload_list() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let a = handle("addScriptToEvaluateOnNewDocument", &json!({"source":"globalThis.a = 1"}),
+            &mut ctx, &session).await.unwrap();
+        for title in ["one", "two"] {
+            handle("navigate", &json!({"url": format!("data:text/html,<title>{title}</title>")}),
+                &mut ctx, &session).await.unwrap();
+        }
+        // Registered after the last Page.navigate, removed after it: the page's
+        // own copy of the list is stale for the next navigation.
+        handle("addScriptToEvaluateOnNewDocument", &json!({"source":"globalThis.b = 1"}),
+            &mut ctx, &session).await.unwrap();
+        handle("removeScriptToEvaluateOnNewDocument", &a, &mut ctx, &session).await.unwrap();
+        handle("navigateToHistoryEntry", &json!({"entryId":0}), &mut ctx, &session).await.unwrap();
+        assert_eq!(preload_state(&mut ctx, &session).await, json!([0, 1]));
+    }
+
+    // #920: a history navigation that fails to load must not move the recorded
+    // currentIndex — the page never actually went anywhere, so a later
+    // getNavigationHistory must still report where it really is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_history_navigation_leaves_current_index_unchanged() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.history = vec![
+                "data:text/html,<p>ok</p>".to_string(),
+                "not-a-url".to_string(),
+            ];
+            page.history_index = 0;
+        }
+
+        let res = handle(
+            "navigateToHistoryEntry",
+            &json!({ "entryId": 1 }),
+            &mut ctx,
+            &session,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "navigating to an invalid entry URL must fail, got {res:?}"
+        );
+
+        let index = ctx.get_session_page(&session).unwrap().history_index;
+        assert_eq!(
+            index, 0,
+            "a failed history navigation must leave currentIndex where the page actually is"
+        );
+    }
+
+    // Guard the success path (there was no coverage): a valid back-navigation
+    // moves currentIndex to the target entry and preserves the history list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_navigation_moves_current_index_on_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.history = vec![
+                "data:text/html,<title>a</title>".to_string(),
+                "data:text/html,<title>b</title>".to_string(),
+            ];
+            page.history_index = 1;
+        }
+
+        handle(
+            "navigateToHistoryEntry",
+            &json!({ "entryId": 0 }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigating back to a valid entry must succeed");
+
+        let page = ctx.get_session_page(&session).unwrap();
+        assert_eq!(page.history_index, 0, "currentIndex must move to the target entry");
+        assert_eq!(page.history.len(), 2, "history must be preserved across the navigation");
+    }
+
+    // #833: chromiumoxide's new_page waits for the initial target's "load"
+    // lifecycle event before returning. Page.enable on a freshly created
+    // (silently loaded) page must emit the initial load sequence once, with a
+    // schema-complete frame, and must not replay it on a second enable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_enable_emits_the_initial_load_events_once() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("enable must succeed");
+        let names: Vec<&str> = ctx
+            .pending_events
+            .iter()
+            .map(|e| e.method.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Page.frameNavigated"),
+            "frameNavigated must be emitted, got {names:?}"
+        );
+        assert!(
+            names.contains(&"Page.loadEventFired"),
+            "loadEventFired must be emitted, got {names:?}"
+        );
+        let frame_navigated = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Page.frameNavigated")
+            .expect("frameNavigated present");
+        let frame = &frame_navigated.params["frame"];
+        for field in ["id", "loaderId", "url", "secureContextType", "crossOriginIsolatedContextType"] {
+            assert!(
+                !frame[field].is_null(),
+                "frameNavigated frame must carry {field}: {frame}"
+            );
+        }
+        assert!(ctx.pending_events.is_empty() == false);
+
+        ctx.pending_events.clear();
+        handle("enable", &json!({}), &mut ctx, &session)
+            .await
+            .expect("second enable must succeed");
+        assert!(
+            ctx.pending_events.is_empty(),
+            "the initial sequence must not replay on a second enable"
+        );
+    }
 
     #[test]
     fn runtime_network_events_reuse_the_document_loader_without_lifecycle_replay() {
@@ -1684,6 +2393,7 @@ mod tests {
             .insert(page_id.clone(), "loader-current".into());
         let event = obscura_browser::NetworkEvent {
             request_id: "fetch-7".into(),
+            intercepted: false,
             url: "https://example.test/data.json".into(),
             method: "GET".into(),
             resource_type: "Fetch".into(),
@@ -1695,6 +2405,7 @@ mod tests {
             )])),
             body_size: 12,
             timestamp: 42.0,
+            error_text: None,
         };
 
         emit_runtime_network_events(
@@ -1703,7 +2414,7 @@ mod tests {
             "frame-1",
             "https://example.test/",
             &page_id,
-            &[event],
+            std::slice::from_ref(&event),
         );
 
         assert_eq!(ctx.pending_events.len(), 3);
@@ -1718,6 +2429,166 @@ mod tests {
                 "Page.frameNavigated" | "Page.lifecycleEvent"
             )
         }));
+
+        // Live interception already sent requestWillBeSent/requestPaused.
+        // Replaying either leaves Playwright waiting for a second request.
+        ctx.pending_events.clear();
+        let event = obscura_browser::NetworkEvent { intercepted: true, ..event };
+        emit_runtime_network_events(
+            &mut ctx, &session_id, "frame-1", "https://example.test/", &page_id,
+            std::slice::from_ref(&event),
+        );
+        assert_eq!(ctx.pending_events.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.responseReceived", "Network.loadingFinished"]);
+        assert!(ctx.pending_events.iter().all(|e| e.params["requestId"] == "fetch-7"));
+
+        ctx.pending_events.clear();
+        ctx.fetch_intercept.enabled = true;
+        emit_navigation_events(
+            &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
+            &page_id, std::slice::from_ref(&event), WaitUntil::Load, true,
+        );
+        let network = ctx.pending_events.iter().filter(|e|
+            e.method.starts_with("Network.") || e.method.starts_with("Fetch.")
+        ).collect::<Vec<_>>();
+        assert_eq!(network.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.responseReceived", "Network.loadingFinished"]);
+        assert!(network.iter().all(|e| e.params["requestId"] == "fetch-7"));
+
+        let failed = obscura_browser::NetworkEvent {
+            intercepted: false, status: 0, error_text: Some("net::ERR_ABORTED".into()), ..event
+        };
+        ctx.pending_events.clear();
+        emit_runtime_network_events(
+            &mut ctx, &session_id, "frame-1", "https://example.test/", &page_id,
+            std::slice::from_ref(&failed),
+        );
+        assert_eq!(ctx.pending_events.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.requestWillBeSent", "Network.loadingFailed"]);
+        assert_eq!(ctx.pending_events[1].params["requestId"], "fetch-7");
+        assert_eq!(ctx.pending_events[1].params["errorText"], "net::ERR_ABORTED");
+        assert_eq!(ctx.pending_events[1].params["canceled"], true);
+        ctx.pending_events.clear();
+        emit_navigation_events(
+            &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
+            &page_id, &[failed], WaitUntil::Load, true,
+        );
+        assert_eq!(ctx.pending_events.iter().filter(|e| e.method.starts_with("Network."))
+            .map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.requestWillBeSent", "Network.loadingFailed"]);
+    }
+
+    #[test]
+    fn post_navigation_fetch_pauses_follow_enable_patterns() {
+        let page_url = "https://example.test/";
+        let events = [
+            (page_url, "Document"),
+            ("https://example.test/image.png", "Image"),
+            ("https://example.test/value/1", "Fetch"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (url, kind))| obscura_browser::NetworkEvent {
+            request_id: format!("finished-{index}"),
+            intercepted: false,
+            url: url.into(),
+            method: "GET".into(),
+            resource_type: kind.into(),
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            error_text: None,
+            body_size: 10,
+            timestamp: 1.0,
+        })
+        .collect::<Vec<_>>();
+        for (patterns, expected) in [
+            (vec!["*never-matches*"], vec![]),
+            (vec!["*/value/*"], vec!["https://example.test/value/1"]),
+            (vec!["*/value/?"], vec!["https://example.test/value/1"]),
+            (vec![r"*/value/\?"], vec![]),
+            (
+                vec!["*"],
+                vec![page_url, "https://example.test/image.png", "https://example.test/value/1"],
+            ),
+        ] {
+            let mut ctx = CdpContext::new();
+            let page_id = ctx.create_page();
+            let session_id = Some(format!("{page_id}-session"));
+            ctx.sessions.insert(session_id.clone().unwrap(), page_id.clone());
+            ctx.fetch_intercept.enabled = true;
+            ctx.fetch_intercept.patterns = patterns.iter().map(|p| p.to_string()).collect();
+            emit_navigation_events(
+                &mut ctx, &session_id, "frame-1", "loader-1", page_url, &page_id,
+                &events, WaitUntil::Load, true,
+            );
+            let paused = ctx
+                .pending_events
+                .iter()
+                .filter(|event| event.method == "Fetch.requestPaused")
+                .map(|event| event.params["request"]["url"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(paused, expected, "patterns {patterns:?}");
+            // Network reporting is independent of interception patterns.
+            for method in ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"] {
+                assert_eq!(
+                    ctx.pending_events.iter().filter(|event| event.method == method).count(),
+                    3,
+                    "{method} with patterns {patterns:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn intercepted_document_is_paused_before_frame_commit() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = Some(format!("{page_id}-session"));
+        ctx.sessions
+            .insert(session_id.clone().unwrap(), page_id.clone());
+        ctx.fetch_intercept.enabled = true;
+        let page_url = "https://example.test/";
+        let event = obscura_browser::NetworkEvent {
+            request_id: "document-internal".into(),
+            intercepted: false,
+            url: page_url.into(),
+            method: "GET".into(),
+            resource_type: "Document".into(),
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            body_size: 0,
+            timestamp: 42.0,
+            error_text: None,
+        };
+
+        emit_navigation_events(
+            &mut ctx,
+            &session_id,
+            "frame-1",
+            "loader-1",
+            page_url,
+            &page_id,
+            &[event],
+            WaitUntil::Load,
+            true,
+        );
+
+        let methods = ctx
+            .pending_events
+            .iter()
+            .map(|event| event.method.as_str())
+            .collect::<Vec<_>>();
+        let paused = methods
+            .iter()
+            .position(|method| *method == "Fetch.requestPaused")
+            .unwrap();
+        let committed = methods
+            .iter()
+            .position(|method| *method == "Page.frameNavigated")
+            .unwrap();
+        assert!(paused < committed, "document pause must precede frame commit: {methods:?}");
     }
 
     #[tokio::test]
@@ -1823,6 +2694,21 @@ mod tests {
             .expect("decodable screenshot")
             .to_rgba8();
         (format, raster)
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn jpeg_encoder_consumes_rgba_frames_directly() {
+        let raster = image::RgbaImage::from_pixel(32, 24, image::Rgba([20, 40, 60, 255]));
+        let encoded = encode_jpeg(&raster, 90).expect("encode RGBA frame");
+        let decoded = image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg)
+            .expect("decode JPEG frame").to_rgb8();
+        assert_eq!(decoded.dimensions(), (32, 24));
+        for pixel in decoded.pixels() {
+            for (actual, expected) in pixel.0.into_iter().zip([20u8, 40, 60]) {
+                assert!(actual.abs_diff(expected) <= 3, "JPEG changed the frame color: {pixel:?}");
+            }
+        }
     }
 
     #[cfg(feature = "render")]
@@ -2107,6 +2993,7 @@ mod tests {
         )
         .await;
         assert!(response.error.is_none(), "override response: {response:?}");
+        pump_screencast_frames(&mut ctx).await;
         let event = ctx
             .pending_events
             .iter()
@@ -2175,6 +3062,57 @@ mod tests {
         let (format, raster) = decode_capture(&rounded_frame.params);
         assert_eq!(format, image::ImageFormat::Png);
         assert_eq!(raster.dimensions(), (51, 41));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn screencast_raster_preserves_straight_alpha() {
+        let (mut ctx, session) = transparent_surface_fixture(80).await;
+        crate::domains::emulation::handle(
+            "setDefaultBackgroundColorOverride",
+            &json!({"color": {"r": 255, "g": 0, "b": 0, "a": 16.0 / 255.0}}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("semi-transparent surface");
+
+        let page = ctx.get_session_page_mut(&session).expect("page");
+        let raster = page
+            .screenshot_region_raster_with_animation_sample(
+                obscura_browser::CaptureRegion::new(0.0, 0.0, 100.0, 80.0, 1.0),
+                page.live_animation_sample(),
+            )
+            .expect("raster");
+        assert_eq!(raster.dimensions(), (100, 80));
+        assert!(raster.pixels().all(|pixel| pixel.0 == [255, 0, 0, 16]));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    async fn scaled_screencast_does_not_allocate_the_native_viewport() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        ctx.get_session_page_mut(&session)
+            .expect("page")
+            .set_viewport((4097.0, 4097.0));
+        ctx.pending_events.clear();
+
+        handle(
+            "startScreencast",
+            &json!({"format": "jpeg", "maxWidth": 50, "maxHeight": 50}),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("scaled frame should rasterize at its output size");
+
+        let frame = ctx
+            .pending_events
+            .iter()
+            .find(|event| event.method == "Page.screencastFrame")
+            .expect("initial frame");
+        let (_, raster) = decode_capture(&frame.params);
+        assert_eq!(raster.dimensions(), (50, 50));
     }
 
     #[cfg(feature = "render")]
@@ -2452,6 +3390,68 @@ mod tests {
         assert_eq!(state.quality, DEFAULT_SCREENSHOT_QUALITY as u8);
         assert_eq!(state.max_width, None);
         assert_eq!(state.max_height, None);
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn bounded_screencast_capture_defers_downscale_to_the_fast_encoder_path() {
+        let state = parse_screencast_state(
+            &json!({"format": "jpeg", "maxWidth": 800, "maxHeight": 450}),
+            1,
+        )
+        .expect("screencast state");
+        let (region, output) =
+            screencast_capture_region((1280.0, 720.0), (0.0, 0.0), &state);
+        assert_eq!(region.scale, 1.0);
+        assert_eq!(output, (800, 450));
+
+        let (oversized, output) =
+            screencast_capture_region((4097.0, 4097.0), (0.0, 0.0), &state);
+        assert!(oversized.scale < 1.0);
+        assert_eq!(output, (450, 450));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn screencast_resize_preserves_triangle_filter_and_rgba_channels() {
+        for (width, height, output) in [
+            (1280, 720, (800, 450)), (127, 79, (83, 51)), (81, 61, (1, 1)),
+            (1, 17, (1, 3)), (80, 60, (80, 60)),
+        ] {
+            let source = image::RgbaImage::from_fn(width, height, |x, y| {
+                image::Rgba([(x * 37) as u8, (y * 71) as u8, ((x ^ y) * 53) as u8, ((x + y) * 29) as u8])
+            });
+            let reference = image::imageops::resize(&source, output.0, output.1, image::imageops::FilterType::Triangle);
+            let actual = resize_screencast_frame(&source, output).unwrap();
+            assert_eq!(actual.dimensions(), output);
+            let largest_rounding_error = reference.as_raw().iter().zip(actual.as_raw())
+                .map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(largest_rounding_error <= 2,
+                "{width}x{height} -> {output:?}: filter/channel mismatch {largest_rounding_error}");
+        }
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test]
+    #[ignore = "release performance check; run alone on the evaluation host"]
+    async fn screencast_frame_budget_keeps_raster_work_below_ten_ms() {
+        let (mut ctx, session) = screenshot_fixture().await;
+        ctx.get_session_page_mut(&session).unwrap().set_viewport((1280.0, 720.0));
+        handle("startScreencast", &json!({
+            "format": "jpeg", "quality": 90, "maxWidth": 800, "maxHeight": 450,
+        }), &mut ctx, &session).await.unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            ctx.pending_events.clear();
+            ctx.screencasts.get_mut(session.as_ref().unwrap()).unwrap().frames_in_flight = 0;
+            let started = std::time::Instant::now();
+            assert!(queue_screencast_frame(&mut ctx, &session, true).unwrap());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        eprintln!("screencast frame median: {:?}", samples[10]);
+        assert!(samples[10] < std::time::Duration::from_millis(10),
+            "frame raster/resize/encode monopolizes the page loop: {:?}", samples[10]);
     }
 
     #[cfg(feature = "render")]
@@ -2946,6 +3946,37 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    /// Regression for #1224: a Playwright context created with
+    /// bypass_csp=True sends Page.setBypassCSP, and the catch-all rejected it
+    /// with "Unknown Page method: setBypassCSP", so new_page() failed before
+    /// it could navigate. Obscura enforces no CSP, so both values ack.
+    #[tokio::test]
+    async fn set_bypass_csp_acks_both_values() {
+        for enabled in [true, false] {
+            let mut ctx = CdpContext::new();
+            let result = handle("setBypassCSP", &json!({ "enabled": enabled }), &mut ctx, &None)
+                .await
+                .unwrap_or_else(|err| panic!("setBypassCSP({enabled}) must ack: {err}"));
+            assert_eq!(result, json!({}));
+        }
+    }
+
+    /// The catch-all is fixed for setBypassCSP only; other unknown methods keep
+    /// erroring, and a malformed parameter still fails on the wire.
+    #[tokio::test]
+    async fn set_bypass_csp_rejects_a_missing_or_non_boolean_enabled() {
+        for params in [json!({}), json!({ "enabled": "yes" })] {
+            let mut ctx = CdpContext::new();
+            let err = handle("setBypassCSP", &params, &mut ctx, &None)
+                .await
+                .expect_err("a non-boolean enabled must error");
+            assert!(
+                err.contains("enabled must be a boolean"),
+                "unexpected error for {params}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
